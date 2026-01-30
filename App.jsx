@@ -66,9 +66,12 @@ const calculateHours = (s, e, breakMins = 0) => {
 
 export default function App() {
   const [scriptUrl, setScriptUrl] = useState(GOOGLE_SCRIPT_URL);
-  const isEditingRef = useRef(false); // Ref para saber si el usuario está escribiendo
   
-  // Estado inicial limpio (se llenará desde la nube)
+  // Refs para control estricto de edición
+  const isEditingRef = useRef(false); 
+  const dirtyKeysRef = useRef(new Set()); 
+
+  // Estado inicial
   const [entries, setEntries] = useState({});
   const [employees, setEmployees] = useState(INITIAL_EMPLOYEES);
 
@@ -87,25 +90,47 @@ export default function App() {
   const holidays = useMemo(() => getHolidaysForYear(year), [year]);
   const isHoliday = (d) => holidays.includes(d);
 
-  // --- SINCRONIZACIÓN REAL (CLOUD FIRST) ---
+  // --- SINCRONIZACIÓN REAL INTELIGENTE ---
 
   const fetchData = async () => {
     if (!scriptUrl) return;
     
-    // FIX: Si el usuario está editando un campo, NO actualizamos desde la nube
-    // para evitar que se borre lo que está escribiendo a medias.
+    // Si el usuario está escribiendo, NO interrumpimos bajo ningún concepto
     if (isEditingRef.current) return;
 
-    // No cambiamos a 'loading' visualmente si ya tenemos datos para no parpadear
     if (Object.keys(entries).length === 0) setStatus('loading');
     
     try {
-      const response = await fetch(scriptUrl);
+      // Agregamos timestamp para evitar caché del navegador (?t=...)
+      const response = await fetch(`${scriptUrl}?t=${Date.now()}`);
       const data = await response.json();
       
+      // FUSIÓN INTELIGENTE (Smart Merge):
       if (data.entries) {
-        setEntries(data.entries); // La nube es la verdad absoluta
+        setEntries(currentEntries => {
+          const mergedEntries = { ...currentEntries };
+          const cloudEntries = data.entries;
+
+          // 1. Incorporamos datos de la nube
+          Object.keys(cloudEntries).forEach(key => {
+            const cloudVal = cloudEntries[key];
+            const localVal = currentEntries[key];
+
+            // Si nosotros hemos tocado esta celda (está 'sucia'), damos prioridad a LO NUESTRO
+            if (dirtyKeysRef.current.has(key)) {
+              if (JSON.stringify(cloudVal) === JSON.stringify(localVal)) {
+                dirtyKeysRef.current.delete(key);
+              } else {
+                return;
+              }
+            }
+            mergedEntries[key] = cloudVal;
+          });
+
+          return mergedEntries;
+        });
       }
+
       if (data.employees) {
         setEmployees(data.employees);
       }
@@ -113,22 +138,18 @@ export default function App() {
       setLastSync(new Date());
     } catch (e) {
       console.warn("Fallo conexión nube:", e);
-      // Si falla la nube, intentamos leer local como último recurso
       const localE = localStorage.getItem('backup_entries');
       if (localE && Object.keys(entries).length === 0) setEntries(JSON.parse(localE));
-      
       setStatus('error');
     }
   };
 
-  // 1. Cargar al inicio y Configurar "Heartbeat" cada 10s
   useEffect(() => {
     fetchData();
-    const intervalId = setInterval(fetchData, 10000); 
+    const intervalId = setInterval(fetchData, 8000); 
     return () => clearInterval(intervalId);
   }, [scriptUrl]);
 
-  // 2. Backup Local de seguridad
   useEffect(() => {
     if (Object.keys(entries).length > 0) {
       localStorage.setItem('backup_entries', JSON.stringify(entries));
@@ -148,11 +169,9 @@ export default function App() {
     ]).then(() => setLibsLoaded(true));
   }, []);
 
-  // 3. Guardar cambios
   const saveEntryToSheet = async (key, date, empId, val) => {
     if (!scriptUrl) return;
     setStatus('saving');
-    
     try {
       await fetch(scriptUrl, {
         method: 'POST',
@@ -182,24 +201,20 @@ export default function App() {
 
   // --- MANEJADORES ---
   
-  // FIX: Handlers para detectar foco y evitar sobreescritura
   const handleFocus = () => { isEditingRef.current = true; };
   const handleBlur = () => { isEditingRef.current = false; };
 
   const handleEntryChange = (dateStr, field, value) => {
     const key = `${dateStr}-${selectedEmployeeId}`;
-    
+    dirtyKeysRef.current.add(key);
+
     const oldEntry = entries[key] || {};
     const newEntry = { ...oldEntry, [field]: value };
     
-    // Auto-fill descanso 60 min si se pone hora de entrada nueva
     if (field === 'start' && !newEntry.break && value) newEntry.break = 60;
 
-    // Actualización optimista
     const newEntries = { ...entries, [key]: newEntry };
     setEntries(newEntries);
-    
-    // Guardar en nube
     saveEntryToSheet(key, dateStr, selectedEmployeeId, newEntry);
   };
 
@@ -212,7 +227,6 @@ export default function App() {
     saveEmployeeToSheet(id, name);
   };
 
-  // --- ESTADÍSTICAS ---
   const getStats = (empId) => {
     let stats = { standard: 0, regular: 0, holiday: 0, vac: 0, personal: 0, balance: 0 };
     for (let d = 1; d <= daysInMonth; d++) {
@@ -220,7 +234,6 @@ export default function App() {
       const key = `${dateStr}-${empId}`;
       const entry = entries[key] || {};
       const isNonWork = isWeekend(dateStr) || isHoliday(dateStr);
-      
       const worked = calculateHours(entry.start, entry.end, entry.break);
       
       if (entry.type === WORK_TYPES.VACACIONES) { stats.vac++; continue; }
@@ -237,7 +250,6 @@ export default function App() {
     return stats;
   };
 
-  // --- EXPORTACIÓN ---
   const exportExcel = () => {
     if (!window.XLSX) return;
     const data = employees.map(e => {
@@ -277,7 +289,6 @@ export default function App() {
             <Clock className="w-6 h-6 text-emerald-200" />
             <div className="flex flex-col">
               <h1 className="text-xl font-bold leading-none">ControlHorario <span className="text-xs font-normal opacity-75">Team</span></h1>
-              {/* Botón de estado clicable para forzar sync */}
               <button 
                 onClick={fetchData}
                 className="flex items-center gap-2 mt-1 hover:bg-emerald-800 rounded px-1 transition-colors text-left"
@@ -323,9 +334,9 @@ export default function App() {
                   <tr>
                     <th className="px-4 py-3">Día</th>
                     <th className="px-4 py-3">Tipo</th>
-                    <th className="px-4 py-3 text-center">In</th>
-                    <th className="px-4 py-3 text-center">Out</th>
-                    <th className="px-2 py-3 text-center w-20" title="Descanso en minutos">Desc. (min)</th>
+                    <th className="px-4 py-3 text-center">Entrada</th>
+                    <th className="px-4 py-3 text-center">Salida</th>
+                    <th className="px-2 py-3 text-center w-24" title="Descanso en minutos">Desc. (min)</th>
                     <th className="px-4 py-3 text-right">Total</th>
                     <th className="px-4 py-3">Notas</th>
                   </tr>
@@ -354,23 +365,29 @@ export default function App() {
                             type="time" 
                             value={entry.start||''} 
                             onChange={(e) => handleEntryChange(dStr, 'start', e.target.value)} 
-                            onFocus={handleFocus} // PAUSA SYNC
-                            onBlur={handleBlur}   // REANUDA SYNC
+                            onFocus={handleFocus} 
+                            onBlur={handleBlur}   
                             className="border rounded px-1 w-20 text-center text-xs" 
                             disabled={entry.type==='Vacaciones'||entry.type==='Asuntos Propios'}
                           />
                         </td>
-                        <td className="px-4 py-2 text-center relative group">
-                          <input 
-                            type="time" 
-                            value={entry.end||''} 
-                            onChange={(e) => handleEntryChange(dStr, 'end', e.target.value)} 
-                            onFocus={handleFocus} // PAUSA SYNC
-                            onBlur={handleBlur}   // REANUDA SYNC
-                            className={`border rounded px-1 w-20 text-center text-xs ${warn ? 'border-amber-500 text-amber-700 font-bold' : ''}`} 
-                            disabled={entry.type==='Vacaciones'||entry.type==='Asuntos Propios'}
-                          />
-                          {warn && <div className="absolute left-full ml-1 top-1 bg-amber-100 text-amber-800 text-[10px] p-1 rounded z-10 whitespace-nowrap">Viernes tarde</div>}
+                        <td className="px-4 py-2 text-center">
+                          <div className="flex flex-col items-center justify-center">
+                            <input 
+                              type="time" 
+                              value={entry.end||''} 
+                              onChange={(e) => handleEntryChange(dStr, 'end', e.target.value)} 
+                              onFocus={handleFocus} 
+                              onBlur={handleBlur}   
+                              className={`border rounded px-1 w-20 text-center text-xs ${warn ? 'border-amber-500 text-amber-700 font-bold' : ''}`} 
+                              disabled={entry.type==='Vacaciones'||entry.type==='Asuntos Propios'}
+                            />
+                            {warn && (
+                              <span className="text-[9px] bg-amber-100 text-amber-700 px-1 rounded mt-1 whitespace-nowrap">
+                                Viernes tarde
+                              </span>
+                            )}
+                          </div>
                         </td>
                         <td className="px-2 py-2 text-center">
                           <div className="flex items-center justify-center relative">
@@ -381,8 +398,8 @@ export default function App() {
                               placeholder="0"
                               value={entry.break || ''} 
                               onChange={(e) => handleEntryChange(dStr, 'break', e.target.value)} 
-                              onFocus={handleFocus} // PAUSA SYNC
-                              onBlur={handleBlur}   // REANUDA SYNC
+                              onFocus={handleFocus} 
+                              onBlur={handleBlur}   
                               className="border rounded px-1 w-12 text-center text-xs bg-gray-50 focus:bg-white" 
                               disabled={entry.type==='Vacaciones'||entry.type==='Asuntos Propios' || !entry.start}
                             />
@@ -396,8 +413,8 @@ export default function App() {
                             placeholder="..." 
                             value={entry.notes||''} 
                             onChange={(e) => handleEntryChange(dStr, 'notes', e.target.value)} 
-                            onFocus={handleFocus} // PAUSA SYNC
-                            onBlur={handleBlur}   // REANUDA SYNC
+                            onFocus={handleFocus} 
+                            onBlur={handleBlur}   
                             className="w-full text-xs bg-transparent border-b border-gray-100 focus:border-blue-400 outline-none"
                           />
                         </td>
