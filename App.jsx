@@ -3,7 +3,7 @@ import {
   Calendar, Clock, Users, FileText, Download, 
   ChevronLeft, ChevronRight, AlertCircle, Briefcase, 
   Palmtree, Cloud, RefreshCw, Save, Coffee, Wifi, WifiOff,
-  UserCheck
+  UserCheck, Monitor
 } from 'lucide-react';
 
 // =================================================================
@@ -14,10 +14,14 @@ const GOOGLE_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbyN72tw3OT75P
 
 // --- CONSTANTES Y UTILIDADES ---
 
+// Añadimos el campo workdayType por defecto
 const INITIAL_EMPLOYEES = [
-  { id: 1, name: 'Empleado 1' }, { id: 2, name: 'Empleado 2' },
-  { id: 3, name: 'Empleado 3' }, { id: 4, name: 'Empleado 4' },
-  { id: 5, name: 'Empleado 5' }, { id: 6, name: 'Empleado 6' },
+  { id: 1, name: 'Empleado 1', workdayType: 'Completa' }, 
+  { id: 2, name: 'Empleado 2', workdayType: 'Completa' },
+  { id: 3, name: 'Empleado 3', workdayType: 'Completa' }, 
+  { id: 4, name: 'Empleado 4', workdayType: 'Completa' },
+  { id: 5, name: 'Empleado 5', workdayType: 'Completa' }, 
+  { id: 6, name: 'Empleado 6', workdayType: 'Completa' },
 ];
 
 const WORK_TYPES = {
@@ -52,13 +56,11 @@ const formatDate = (y, m, d) => `${y}-${String(m + 1).padStart(2, '0')}-${String
 const isWeekend = (dateStr) => { const d = new Date(dateStr).getDay(); return d === 0 || d === 6; };
 const isFriday = (dateStr) => new Date(dateStr).getDay() === 5;
 
-// Calcula diferencia en minutos de forma segura (evita NaN)
 const diffMinutes = (start, end) => {
   if (!start || !end) return 0;
   const [sH, sM] = start.split(':').map(Number);
   const [eH, eM] = end.split(':').map(Number);
   
-  // Validación extra anti-NaN
   if (isNaN(sH) || isNaN(sM) || isNaN(eH) || isNaN(eM)) return 0;
 
   let diff = (eH * 60 + eM) - (sH * 60 + sM);
@@ -66,12 +68,11 @@ const diffMinutes = (start, end) => {
   return diff;
 };
 
-// Cálculo actualizado: Jornada - Descanso
 const calculateHours = (s, e, breakMins = 0) => {
   const totalMins = diffMinutes(s, e);
   const netMins = Math.max(0, totalMins - (Number(breakMins) || 0));
   const res = Number((netMins / 60).toFixed(2));
-  return isNaN(res) ? 0 : res; // Asegura que nunca devuelva NaN
+  return isNaN(res) ? 0 : res;
 };
 
 export default function App() {
@@ -123,7 +124,18 @@ export default function App() {
           return mergedEntries;
         });
       }
-      if (data.employees) setEmployees(data.employees);
+      if (data.employees) {
+        // Fusionar empleados remotos con locales para preservar el campo workdayType si la nube no lo tiene
+        setEmployees(prevEmployees => {
+          return data.employees.map(remEmp => {
+            const localEmp = prevEmployees.find(l => l.id === remEmp.id);
+            return {
+              ...remEmp,
+              workdayType: localEmp?.workdayType || 'Completa' // Preservar o default
+            };
+          });
+        });
+      }
       setStatus('success');
       setLastSync(new Date());
     } catch (e) {
@@ -146,17 +158,32 @@ export default function App() {
     }
   }, [entries]);
 
+  // Guardar empleados también para persistir el tipo de jornada
   useEffect(() => {
-    const loadScript = (src) => new Promise(resolve => {
+    localStorage.setItem('backup_employees', JSON.stringify(employees));
+  }, [employees]);
+
+  useEffect(() => {
+    const loadScript = (src) => new Promise((resolve, reject) => {
       if (document.querySelector(`script[src="${src}"]`)) return resolve();
-      const s = document.createElement('script'); s.src = src; s.onload = resolve;
+      const s = document.createElement('script'); 
+      s.src = src; 
+      s.onload = resolve;
+      s.onerror = reject;
       document.head.appendChild(s);
     });
-    Promise.all([
-      loadScript("https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"),
-      loadScript("https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"),
-      loadScript("https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.1/jspdf.plugin.autotable.min.js")
-    ]).then(() => setLibsLoaded(true));
+
+    const loadLibs = async () => {
+      try {
+        await loadScript("https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js");
+        await loadScript("https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js");
+        await loadScript("https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.1/jspdf.plugin.autotable.min.js");
+        setLibsLoaded(true);
+      } catch (err) {
+        console.error("Error cargando librerías:", err);
+      }
+    };
+    loadLibs();
   }, []);
 
   const saveEntryToSheet = async (key, date, empId, val) => {
@@ -198,7 +225,12 @@ export default function App() {
     const oldEntry = entries[key] || {};
     const newEntry = { ...oldEntry, [field]: value };
     
-    if (field === 'start' && !newEntry.break && value) newEntry.break = 60;
+    // Lógica automática de descanso
+    if (field === 'start' && !newEntry.break && value) {
+      const emp = employees.find(e => e.id === selectedEmployeeId);
+      // Si es Parcial -> 0 min, si es Completa -> 60 min
+      newEntry.break = emp?.workdayType === 'Parcial' ? 0 : 60;
+    }
 
     const newEntries = { ...entries, [key]: newEntry };
     setEntries(newEntries);
@@ -210,20 +242,37 @@ export default function App() {
     setEmployees(newEmps);
   };
 
+  // Nuevo manejador para el tipo de jornada
+  const handleEmployeeTypeChange = (id, newType) => {
+    const newEmps = employees.map(e => e.id === id ? { ...e, workdayType: newType } : e);
+    setEmployees(newEmps);
+    // Nota: El tipo de jornada se guarda localmente (localStorage) 
+    // ya que la hoja de cálculo actual solo soporta ID y Nombre.
+  };
+
   const handleEmployeeNameBlur = (id, name) => {
     saveEmployeeToSheet(id, name);
+  };
+
+  const getTargetHours = (empId) => {
+    const emp = employees.find(e => e.id === empId);
+    return emp?.workdayType === 'Parcial' ? 7 : 8;
   };
 
   const getStats = (empId) => {
     let stats = { 
       standard: 0, 
       regular: 0, 
-      holiday: 0, 
+      holidayHours: 0, 
+      holidayDays: 0, 
       vac: 0, 
-      personal: 0, // Días completos
-      personalHours: 0, // Horas parciales
+      telework: 0,
+      personal: 0, 
+      personalHours: 0, 
       balance: 0 
     };
+
+    const targetH = getTargetHours(empId);
 
     for (let d = 1; d <= daysInMonth; d++) {
       const dateStr = formatDate(year, month, d);
@@ -234,37 +283,34 @@ export default function App() {
       const worked = calculateHours(entry.start, entry.end, entry.break);
       
       if (entry.type === WORK_TYPES.VACACIONES) { stats.vac++; continue; }
+      if (entry.type === WORK_TYPES.TELETRABAJO) { stats.telework++; }
       
-      // Asuntos Propios
       if (entry.type === WORK_TYPES.PERSONAL) {
         if (entry.start && entry.end) {
-          // Calculamos la ausencia parcial si existen las horas
           let absenceH = 0;
           if (entry.pOut && entry.pIn) {
              const absMins = diffMinutes(entry.pOut, entry.pIn);
              const val = Number((absMins / 60).toFixed(2));
-             absenceH = isNaN(val) ? 0 : val; // Protección NaN
+             absenceH = isNaN(val) ? 0 : val;
           }
           
-          stats.standard += 8;
+          stats.standard += targetH;
           stats.regular += worked; 
           stats.personalHours += absenceH; 
-          // Simplificación: Balance = (Worked + Absence) - 8
-          stats.balance += ((worked + absenceH) - 8);
+          stats.balance += ((worked + absenceH) - targetH);
         } else {
-          // Día completo sin horas definidas
           stats.personal++; 
         }
         continue;
       }
 
-      // Día Normal
       if (!isNonWork) {
-        stats.standard += 8;
+        stats.standard += targetH;
         stats.regular += worked;
-        stats.balance += (worked - 8);
+        stats.balance += (worked - targetH);
       } else if (worked > 0) {
-        stats.holiday += worked;
+        stats.holidayHours += worked;
+        stats.holidayDays++;
       }
     }
     return stats;
@@ -274,43 +320,58 @@ export default function App() {
     if (!window.XLSX) return;
     const data = employees.map(e => {
       const s = getStats(e.id);
+      const extraHours = s.balance > 0 ? Math.floor(s.balance) : 0;
+      
       return { 
         "Empleado": e.name, 
+        "Jornada": e.workdayType || 'Completa',
         "H. Teóricas": s.standard, 
         "Trabajadas": s.regular.toFixed(2), 
+        "Días Teletrabajo": s.telework,
+        "Días Vacaciones": s.vac,
         "H. Ausencia Justif.": s.personalHours.toFixed(2),
-        "Saldo": s.balance.toFixed(2), 
-        "Guardia Festivo": s.holiday.toFixed(2), 
-        "Vacaciones": s.vac, 
-        "Días Asuntos P.": s.personal 
+        "Saldo Total": s.balance.toFixed(2), 
+        "Horas Extra a Pagar": extraHours, 
+        "Días Guardia": s.holidayDays,
+        "Horas Guardia": s.holidayHours.toFixed(2)
       };
     });
     const wb = window.XLSX.utils.book_new();
     const ws = window.XLSX.utils.json_to_sheet(data);
-    ws['!cols'] = [{wch:20},{wch:10},{wch:10},{wch:15},{wch:10},{wch:15},{wch:10},{wch:15}];
+    ws['!cols'] = [{wch:20},{wch:10},{wch:10},{wch:10},{wch:15},{wch:15},{wch:15},{wch:10},{wch:15},{wch:10},{wch:10}];
     window.XLSX.utils.book_append_sheet(wb, ws, "Informe");
     window.XLSX.writeFile(wb, `Fichajes_${year}_${month+1}.xlsx`);
   };
 
   const exportPDF = () => {
-    if (!window.jspdf) return;
-    const { jsPDF } = window.jspdf; const doc = new jsPDF();
-    const rows = employees.map(e => {
-      const s = getStats(e.id);
-      return [
-        e.name, s.standard, s.regular.toFixed(2), s.personalHours.toFixed(2), 
-        s.balance.toFixed(2), s.holiday.toFixed(2), s.vac, s.personal
-      ];
-    });
-    doc.text(`Informe ${new Date(year, month).toLocaleString('es',{month:'long',year:'numeric'})}`, 14, 15);
-    doc.autoTable({ 
-      head: [["Empleado", "Teóricas", "Trabajadas", "H. Ausencia", "Saldo", "Guardia", "Vac", "Días AP"]], 
-      body: rows, startY: 25, styles: { fontSize: 8 }
-    });
-    doc.save(`Fichajes_${year}_${month+1}.pdf`);
+    if (!window.jspdf) return alert('Librerías no cargadas. Espera unos segundos.');
+    try {
+      const { jsPDF } = window.jspdf; 
+      const doc = new jsPDF('l'); 
+      if (typeof doc.autoTable !== 'function') return alert('Plugin PDF no listo.');
+
+      const rows = employees.map(e => {
+        const s = getStats(e.id);
+        const extraHours = s.balance > 0 ? Math.floor(s.balance) : 0; 
+        return [
+          e.name, e.workdayType || 'Completa', s.standard, s.regular.toFixed(2), s.telework, s.vac,
+          s.personalHours.toFixed(2), s.balance.toFixed(2), extraHours,
+          `${s.holidayDays}d (${s.holidayHours.toFixed(2)}h)`
+        ];
+      });
+      
+      doc.text(`Informe ${new Date(year, month).toLocaleString('es',{month:'long',year:'numeric'})}`, 14, 15);
+      doc.autoTable({ 
+        head: [["Empleado", "Tipo", "Teóricas", "Trabajadas", "Teletrab.", "Vacac.", "Ausenc.", "Saldo", "Extra", "Guardias"]], 
+        body: rows, startY: 25, styles: { fontSize: 8 }
+      });
+      doc.save(`Fichajes_${year}_${month+1}.pdf`);
+    } catch (e) { console.error(e); }
   };
 
   if (!scriptUrl) return <div className="p-10 text-center">Falta configurar URL de Google Script</div>;
+
+  const currentEmployee = employees.find(e => e.id === selectedEmployeeId);
 
   return (
     <div className="min-h-screen bg-gray-100 font-sans text-gray-800">
@@ -346,11 +407,23 @@ export default function App() {
       <main className="container mx-auto px-4 py-6">
         {activeTab === 'timesheet' && (
           <div className="bg-white rounded-lg shadow overflow-hidden">
-            <div className="p-4 border-b bg-gray-50 flex justify-between items-center">
-              <div>
-                <h3 className="font-bold text-gray-800">Ficha: {employees.find(e => e.id === selectedEmployeeId)?.name}</h3>
-                <p className="text-xs text-gray-500 capitalize">{new Date(year, month).toLocaleString('es-ES', { month: 'long', year: 'numeric' })}</p>
+            <div className="p-4 border-b bg-gray-50 flex flex-col md:flex-row justify-between items-center gap-4">
+              <div className="flex items-center gap-3">
+                <div className="flex flex-col">
+                  <h3 className="font-bold text-gray-800">Ficha: {currentEmployee?.name}</h3>
+                  <p className="text-xs text-gray-500 capitalize">{new Date(year, month).toLocaleString('es-ES', { month: 'long', year: 'numeric' })}</p>
+                </div>
+                {/* SELECTOR TIPO JORNADA */}
+                <select 
+                  value={currentEmployee?.workdayType || 'Completa'} 
+                  onChange={(e) => handleEmployeeTypeChange(currentEmployee.id, e.target.value)}
+                  className="text-xs border rounded p-1 bg-gray-50 text-gray-700 ml-2 focus:ring-2 focus:ring-emerald-500 outline-none"
+                >
+                  <option value="Completa">Completa (8h)</option>
+                  <option value="Parcial">Parcial (7h)</option>
+                </select>
               </div>
+              
               <select value={selectedEmployeeId} onChange={(e) => setSelectedEmployeeId(Number(e.target.value))} className="border rounded p-2 text-sm">
                 {employees.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
               </select>
@@ -365,6 +438,7 @@ export default function App() {
                     <th className="px-4 py-3 text-center">Salida</th>
                     <th className="px-2 py-3 text-center w-24" title="Descanso en minutos">Desc. (min)</th>
                     <th className="px-4 py-3 text-right">Total</th>
+                    <th className="px-4 py-3 text-right bg-yellow-50 text-yellow-800" title="Horas extra del día">Extra Día</th>
                     <th className="px-4 py-3">Notas / Incidencias</th>
                   </tr>
                 </thead>
@@ -377,8 +451,15 @@ export default function App() {
                     const warn = isFri && entry.end && parseInt(entry.end) >= 15 && h > 7;
                     
                     const isPersonalAffair = entry.type === WORK_TYPES.PERSONAL;
-                    // Deshabilitar inputs SOLO si es Vacaciones o Baja (Asuntos Propios ahora permite editar)
                     const disabledInputs = entry.type === WORK_TYPES.VACACIONES || entry.type === WORK_TYPES.BAJA;
+
+                    // Cálculo Extra Diario
+                    let dailyExtra = 0;
+                    if (!isHol && !isWk && entry.type !== WORK_TYPES.VACACIONES && entry.type !== WORK_TYPES.BAJA && h > 0) {
+                      const target = getTargetHours(selectedEmployeeId);
+                      // Si es Asuntos Propios, ajustamos lógica si quieres, pero por defecto comparamos trabajado vs objetivo
+                      dailyExtra = h - target;
+                    }
 
                     return (
                       <tr key={day} className={`border-b ${isHol ? 'bg-red-50' : isWk ? 'bg-orange-50' : 'hover:bg-gray-50'}`}>
@@ -409,6 +490,9 @@ export default function App() {
                           </div>
                         </td>
                         <td className="px-4 py-2 text-right font-mono font-medium">{h > 0 ? h.toFixed(2) : '-'}</td>
+                        <td className={`px-4 py-2 text-right font-mono text-xs ${dailyExtra > 0 ? 'text-green-600 font-bold' : dailyExtra < 0 ? 'text-red-500' : 'text-gray-400'} bg-yellow-50`}>
+                          {h > 0 && !isHol && !isWk ? (dailyExtra > 0 ? '+' : '') + dailyExtra.toFixed(2) : '-'}
+                        </td>
                         <td className="px-4 py-2">
                           {isPersonalAffair ? (
                             <div className="flex flex-col gap-1 bg-purple-50 p-1 rounded border border-purple-100">
@@ -446,25 +530,43 @@ export default function App() {
               <table className="w-full text-sm text-left border rounded-lg">
                 <thead className="bg-gray-100 text-xs text-gray-700 uppercase">
                   <tr>
-                    <th className="px-4 py-3">Empleado</th>
-                    <th className="px-4 py-3 text-right">Teóricas</th>
-                    <th className="px-4 py-3 text-right">Trabajadas</th>
-                    <th className="px-4 py-3 text-right bg-purple-50 text-purple-800">H. Ausencia Justif.</th>
-                    <th className="px-4 py-3 text-right bg-blue-50">Saldo Total</th>
-                    <th className="px-4 py-3 text-right bg-orange-50 text-orange-800">Festivo</th>
+                    <th className="px-2 py-3">Empleado</th>
+                    <th className="px-2 py-3 text-center">Tipo</th>
+                    <th className="px-2 py-3 text-right">Teóricas</th>
+                    <th className="px-2 py-3 text-right">Trabajadas</th>
+                    <th className="px-2 py-3 text-center bg-blue-50 text-blue-800">Teletrabajo</th>
+                    <th className="px-2 py-3 text-center bg-green-50 text-green-800">Vacaciones</th>
+                    <th className="px-2 py-3 text-right bg-purple-50 text-purple-800">H. Ausencia</th>
+                    <th className="px-2 py-3 text-right bg-gray-200 font-bold">Saldo</th>
+                    <th className="px-2 py-3 text-right bg-yellow-50 text-yellow-900 font-bold">Extra</th>
+                    <th className="px-2 py-3 text-right bg-orange-50 text-orange-800">Guardias</th>
                   </tr>
                 </thead>
                 <tbody>
                   {employees.map(e => {
                     const s = getStats(e.id);
+                    const extraHours = s.balance > 0 ? Math.floor(s.balance) : 0;
                     return (
                       <tr key={e.id} className="border-b">
-                        <td className="px-4 py-3 font-medium">{e.name}</td>
-                        <td className="px-4 py-3 text-right">{s.standard}h</td>
-                        <td className="px-4 py-3 text-right">{s.regular.toFixed(2)}h</td>
-                        <td className="px-4 py-3 text-right bg-purple-50 text-purple-800 font-medium">{s.personalHours > 0 ? s.personalHours.toFixed(2)+'h' : '-'}</td>
-                        <td className={`px-4 py-3 text-right font-bold bg-blue-50 ${s.balance>=0?'text-green-600':'text-red-600'}`}>{s.balance.toFixed(2)}h</td>
-                        <td className="px-4 py-3 text-right bg-orange-50 font-bold text-orange-800">{s.holiday>0?s.holiday.toFixed(2)+'h':'-'}</td>
+                        <td className="px-2 py-3 font-medium">{e.name}</td>
+                        <td className="px-2 py-3 text-center text-[10px] text-gray-500">{e.workdayType || 'Completa'}</td>
+                        <td className="px-2 py-3 text-right text-gray-500">{s.standard}h</td>
+                        <td className="px-2 py-3 text-right">{s.regular.toFixed(2)}h</td>
+                        <td className="px-2 py-3 text-center bg-blue-50 text-blue-800">{s.telework > 0 ? s.telework + ' d' : '-'}</td>
+                        <td className="px-2 py-3 text-center bg-green-50 text-green-800">{s.vac > 0 ? s.vac + ' d' : '-'}</td>
+                        <td className="px-2 py-3 text-right bg-purple-50 text-purple-800">{s.personalHours > 0 ? s.personalHours.toFixed(2)+'h' : '-'}</td>
+                        <td className={`px-2 py-3 text-right font-bold bg-gray-200 ${s.balance>=0?'text-green-700':'text-red-600'}`}>{s.balance.toFixed(2)}h</td>
+                        <td className="px-2 py-3 text-right bg-yellow-50 font-bold text-yellow-900">
+                          {extraHours > 0 ? '+' + extraHours + 'h' : '-'}
+                        </td>
+                        <td className="px-2 py-3 text-right bg-orange-50 font-bold text-orange-800">
+                          {s.holidayDays > 0 ? (
+                            <div className="flex flex-col text-[10px] leading-tight">
+                              <span>{s.holidayDays} días</span>
+                              <span>{s.holidayHours.toFixed(2)}h</span>
+                            </div>
+                          ) : '-'}
+                        </td>
                       </tr>
                     );
                   })}
