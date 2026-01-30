@@ -54,6 +54,11 @@ const calculateHours = (s, e) => {
   let diff = (eH * 60 + eM) - (sH * 60 + sM); if (diff < 0) diff += 24 * 60;
   return Number((diff / 60).toFixed(2));
 };
+// Helper que faltaba y causaba el error
+const isWeekend = (dateStr) => {
+  const d = new Date(dateStr).getDay();
+  return d === 0 || d === 6;
+};
 
 export default function App() {
   const [scriptUrl, setScriptUrl] = useState(GOOGLE_SCRIPT_URL);
@@ -107,11 +112,6 @@ export default function App() {
     if (!scriptUrl) return;
     setStatus('saving');
     
-    // Payload para enviar a Google Apps Script
-    // Usamos 'no-cors' con fetch es complicado obtener respuesta, 
-    // pero Apps Script suele necesitar POST con redirect follow o text/plain para evitar CORS preflight issues complejos.
-    // El truco estándar es usar Content-Type: text/plain para evitar preflight.
-    
     try {
       await fetch(scriptUrl, {
         method: 'POST',
@@ -120,7 +120,7 @@ export default function App() {
       setStatus('success');
     } catch (e) {
       console.error(e);
-      setStatus('error'); // Aunque a veces da error de red opaco en no-cors, asumimos éxito si no hay catch grave
+      setStatus('error');
     }
   };
 
@@ -146,9 +146,7 @@ export default function App() {
     const newEntries = { ...entries, [key]: newEntry };
     setEntries(newEntries);
 
-    // 2. Debounce simple o guardado directo (aquí directo por simplicidad)
-    // Para evitar saturar Google Sheets, idealmente esperaríamos 1s antes de enviar, 
-    // pero para este uso enviaremos directo.
+    // 2. Guardado directo
     saveEntryToSheet(key, dateStr, selectedEmployeeId, newEntry);
   };
 
@@ -168,6 +166,7 @@ export default function App() {
       const dateStr = formatDate(year, month, d);
       const key = `${dateStr}-${empId}`;
       const entry = entries[key] || {};
+      // Ahora isWeekend está definido
       const isNonWork = isWeekend(dateStr) || isHoliday(dateStr);
       const worked = calculateHours(entry.start, entry.end);
       
