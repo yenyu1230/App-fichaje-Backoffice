@@ -66,6 +66,7 @@ const calculateHours = (s, e, breakMins = 0) => {
 
 export default function App() {
   const [scriptUrl, setScriptUrl] = useState(GOOGLE_SCRIPT_URL);
+  const isEditingRef = useRef(false); // Ref para saber si el usuario está escribiendo
   
   // Estado inicial limpio (se llenará desde la nube)
   const [entries, setEntries] = useState({});
@@ -90,8 +91,12 @@ export default function App() {
 
   const fetchData = async () => {
     if (!scriptUrl) return;
-    // No cambiamos a 'loading' visualmente si ya tenemos datos para no parpadear,
-    // solo indicamos actualización discreta
+    
+    // FIX: Si el usuario está editando un campo, NO actualizamos desde la nube
+    // para evitar que se borre lo que está escribiendo a medias.
+    if (isEditingRef.current) return;
+
+    // No cambiamos a 'loading' visualmente si ya tenemos datos para no parpadear
     if (Object.keys(entries).length === 0) setStatus('loading');
     
     try {
@@ -116,14 +121,14 @@ export default function App() {
     }
   };
 
-  // 1. Cargar al inicio y Configurar "Heartbeat" (Latido) cada 10s
+  // 1. Cargar al inicio y Configurar "Heartbeat" cada 10s
   useEffect(() => {
     fetchData();
-    const intervalId = setInterval(fetchData, 10000); // Sincroniza cada 10 segundos
+    const intervalId = setInterval(fetchData, 10000); 
     return () => clearInterval(intervalId);
   }, [scriptUrl]);
 
-  // 2. Backup Local de seguridad (Solo escritura, lectura solo en emergencia)
+  // 2. Backup Local de seguridad
   useEffect(() => {
     if (Object.keys(entries).length > 0) {
       localStorage.setItem('backup_entries', JSON.stringify(entries));
@@ -148,7 +153,6 @@ export default function App() {
     if (!scriptUrl) return;
     setStatus('saving');
     
-    // Envío usando text/plain para evitar CORS preflight complex en Google Apps Script
     try {
       await fetch(scriptUrl, {
         method: 'POST',
@@ -177,6 +181,10 @@ export default function App() {
   };
 
   // --- MANEJADORES ---
+  
+  // FIX: Handlers para detectar foco y evitar sobreescritura
+  const handleFocus = () => { isEditingRef.current = true; };
+  const handleBlur = () => { isEditingRef.current = false; };
 
   const handleEntryChange = (dateStr, field, value) => {
     const key = `${dateStr}-${selectedEmployeeId}`;
@@ -341,9 +349,27 @@ export default function App() {
                             {Object.values(WORK_TYPES).map(t => <option key={t} value={t}>{t}</option>)}
                           </select>
                         </td>
-                        <td className="px-4 py-2 text-center"><input type="time" value={entry.start||''} onChange={(e) => handleEntryChange(dStr, 'start', e.target.value)} className="border rounded px-1 w-20 text-center text-xs" disabled={entry.type==='Vacaciones'||entry.type==='Asuntos Propios'}/></td>
+                        <td className="px-4 py-2 text-center">
+                          <input 
+                            type="time" 
+                            value={entry.start||''} 
+                            onChange={(e) => handleEntryChange(dStr, 'start', e.target.value)} 
+                            onFocus={handleFocus} // PAUSA SYNC
+                            onBlur={handleBlur}   // REANUDA SYNC
+                            className="border rounded px-1 w-20 text-center text-xs" 
+                            disabled={entry.type==='Vacaciones'||entry.type==='Asuntos Propios'}
+                          />
+                        </td>
                         <td className="px-4 py-2 text-center relative group">
-                          <input type="time" value={entry.end||''} onChange={(e) => handleEntryChange(dStr, 'end', e.target.value)} className={`border rounded px-1 w-20 text-center text-xs ${warn ? 'border-amber-500 text-amber-700 font-bold' : ''}`} disabled={entry.type==='Vacaciones'||entry.type==='Asuntos Propios'}/>
+                          <input 
+                            type="time" 
+                            value={entry.end||''} 
+                            onChange={(e) => handleEntryChange(dStr, 'end', e.target.value)} 
+                            onFocus={handleFocus} // PAUSA SYNC
+                            onBlur={handleBlur}   // REANUDA SYNC
+                            className={`border rounded px-1 w-20 text-center text-xs ${warn ? 'border-amber-500 text-amber-700 font-bold' : ''}`} 
+                            disabled={entry.type==='Vacaciones'||entry.type==='Asuntos Propios'}
+                          />
                           {warn && <div className="absolute left-full ml-1 top-1 bg-amber-100 text-amber-800 text-[10px] p-1 rounded z-10 whitespace-nowrap">Viernes tarde</div>}
                         </td>
                         <td className="px-2 py-2 text-center">
@@ -355,6 +381,8 @@ export default function App() {
                               placeholder="0"
                               value={entry.break || ''} 
                               onChange={(e) => handleEntryChange(dStr, 'break', e.target.value)} 
+                              onFocus={handleFocus} // PAUSA SYNC
+                              onBlur={handleBlur}   // REANUDA SYNC
                               className="border rounded px-1 w-12 text-center text-xs bg-gray-50 focus:bg-white" 
                               disabled={entry.type==='Vacaciones'||entry.type==='Asuntos Propios' || !entry.start}
                             />
@@ -362,7 +390,17 @@ export default function App() {
                           </div>
                         </td>
                         <td className="px-4 py-2 text-right font-mono font-medium">{h > 0 ? h.toFixed(2) : '-'}</td>
-                        <td className="px-4 py-2"><input type="text" placeholder="..." value={entry.notes||''} onChange={(e) => handleEntryChange(dStr, 'notes', e.target.value)} className="w-full text-xs bg-transparent border-b border-gray-100 focus:border-blue-400 outline-none"/></td>
+                        <td className="px-4 py-2">
+                          <input 
+                            type="text" 
+                            placeholder="..." 
+                            value={entry.notes||''} 
+                            onChange={(e) => handleEntryChange(dStr, 'notes', e.target.value)} 
+                            onFocus={handleFocus} // PAUSA SYNC
+                            onBlur={handleBlur}   // REANUDA SYNC
+                            className="w-full text-xs bg-transparent border-b border-gray-100 focus:border-blue-400 outline-none"
+                          />
+                        </td>
                       </tr>
                     );
                   })}
