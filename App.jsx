@@ -1,8 +1,8 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { 
   Calendar, Clock, Users, FileText, Download, 
   ChevronLeft, ChevronRight, AlertCircle, Briefcase, 
-  Palmtree, Cloud, RefreshCw, Save, Coffee
+  Palmtree, Cloud, RefreshCw, Save, Coffee, Wifi, WifiOff
 } from 'lucide-react';
 
 // =================================================================
@@ -67,20 +67,9 @@ const calculateHours = (s, e, breakMins = 0) => {
 export default function App() {
   const [scriptUrl, setScriptUrl] = useState(GOOGLE_SCRIPT_URL);
   
-  // Inicialización inteligente: carga backup local primero para evitar "pantalla vacía"
-  const [entries, setEntries] = useState(() => {
-    try {
-      const saved = localStorage.getItem('backup_entries');
-      return saved ? JSON.parse(saved) : {};
-    } catch (e) { return {}; }
-  });
-
-  const [employees, setEmployees] = useState(() => {
-    try {
-      const saved = localStorage.getItem('backup_employees');
-      return saved ? JSON.parse(saved) : INITIAL_EMPLOYEES;
-    } catch (e) { return INITIAL_EMPLOYEES; }
-  });
+  // Estado inicial limpio (se llenará desde la nube)
+  const [entries, setEntries] = useState({});
+  const [employees, setEmployees] = useState(INITIAL_EMPLOYEES);
 
   // Fecha actual automática al iniciar
   const [currentDate, setCurrentDate] = useState(new Date());
@@ -89,6 +78,7 @@ export default function App() {
   const [selectedEmployeeId, setSelectedEmployeeId] = useState(1);
   const [libsLoaded, setLibsLoaded] = useState(false);
   const [status, setStatus] = useState('idle');
+  const [lastSync, setLastSync] = useState(null);
 
   const year = currentDate.getFullYear();
   const month = currentDate.getMonth();
@@ -96,42 +86,51 @@ export default function App() {
   const holidays = useMemo(() => getHolidaysForYear(year), [year]);
   const isHoliday = (d) => holidays.includes(d);
 
-  // --- SINCRONIZACIÓN HÍBRIDA (LOCAL + NUBE) ---
+  // --- SINCRONIZACIÓN REAL (CLOUD FIRST) ---
 
-  // 1. Guardar en LocalStorage cada vez que cambie algo (Seguridad inmediata)
-  useEffect(() => {
-    localStorage.setItem('backup_entries', JSON.stringify(entries));
-  }, [entries]);
-
-  useEffect(() => {
-    localStorage.setItem('backup_employees', JSON.stringify(employees));
-  }, [employees]);
-
-  // 2. Intentar cargar de la nube al inicio
   const fetchData = async () => {
     if (!scriptUrl) return;
-    setStatus('loading');
+    // No cambiamos a 'loading' visualmente si ya tenemos datos para no parpadear,
+    // solo indicamos actualización discreta
+    if (Object.keys(entries).length === 0) setStatus('loading');
+    
     try {
       const response = await fetch(scriptUrl);
       const data = await response.json();
       
-      // Fusionar datos de la nube con locales si existen
       if (data.entries) {
-        setEntries(prev => ({ ...prev, ...data.entries }));
+        setEntries(data.entries); // La nube es la verdad absoluta
       }
       if (data.employees) {
         setEmployees(data.employees);
       }
       setStatus('success');
+      setLastSync(new Date());
     } catch (e) {
-      console.warn("No se pudo conectar con Google Sheets, usando datos locales.", e);
-      setStatus('error'); // Muestra error pero la app sigue funcionando con localStorage
+      console.warn("Fallo conexión nube:", e);
+      // Si falla la nube, intentamos leer local como último recurso
+      const localE = localStorage.getItem('backup_entries');
+      if (localE && Object.keys(entries).length === 0) setEntries(JSON.parse(localE));
+      
+      setStatus('error');
     }
   };
 
+  // 1. Cargar al inicio y Configurar "Heartbeat" (Latido) cada 10s
   useEffect(() => {
     fetchData();
-    // Cargar librerías
+    const intervalId = setInterval(fetchData, 10000); // Sincroniza cada 10 segundos
+    return () => clearInterval(intervalId);
+  }, [scriptUrl]);
+
+  // 2. Backup Local de seguridad (Solo escritura, lectura solo en emergencia)
+  useEffect(() => {
+    if (Object.keys(entries).length > 0) {
+      localStorage.setItem('backup_entries', JSON.stringify(entries));
+    }
+  }, [entries]);
+
+  useEffect(() => {
     const loadScript = (src) => new Promise(resolve => {
       if (document.querySelector(`script[src="${src}"]`)) return resolve();
       const s = document.createElement('script'); s.src = src; s.onload = resolve;
@@ -142,20 +141,24 @@ export default function App() {
       loadScript("https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"),
       loadScript("https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.1/jspdf.plugin.autotable.min.js")
     ]).then(() => setLibsLoaded(true));
-  }, [scriptUrl]);
+  }, []);
 
-  // 3. Guardar en la nube (Fondo)
+  // 3. Guardar cambios
   const saveEntryToSheet = async (key, date, empId, val) => {
     if (!scriptUrl) return;
     setStatus('saving');
+    
+    // Envío usando text/plain para evitar CORS preflight complex en Google Apps Script
     try {
       await fetch(scriptUrl, {
         method: 'POST',
+        headers: { "Content-Type": "text/plain;charset=utf-8" },
         body: JSON.stringify({ action: 'save_entry', key, date, empId, val })
       });
       setStatus('success');
+      setLastSync(new Date());
     } catch (e) {
-      // Si falla la nube, no pasa nada grave porque ya está en localStorage
+      console.error("Error guardando:", e);
       setStatus('error'); 
     }
   };
@@ -166,6 +169,7 @@ export default function App() {
     try {
       await fetch(scriptUrl, {
         method: 'POST',
+        headers: { "Content-Type": "text/plain;charset=utf-8" },
         body: JSON.stringify({ action: 'save_employee', id, name })
       });
       setStatus('success');
@@ -180,13 +184,14 @@ export default function App() {
     const oldEntry = entries[key] || {};
     const newEntry = { ...oldEntry, [field]: value };
     
-    // Si es un cambio nuevo, aseguramos defaults
-    if (field === 'start' && !newEntry.break) newEntry.break = 60; // Default 1h descanso al poner hora entrada
+    // Auto-fill descanso 60 min si se pone hora de entrada nueva
+    if (field === 'start' && !newEntry.break && value) newEntry.break = 60;
 
+    // Actualización optimista
     const newEntries = { ...entries, [key]: newEntry };
     setEntries(newEntries);
     
-    // Guardado nube asíncrono
+    // Guardar en nube
     saveEntryToSheet(key, dateStr, selectedEmployeeId, newEntry);
   };
 
@@ -262,14 +267,19 @@ export default function App() {
         <div className="container mx-auto flex justify-between items-center">
           <div className="flex items-center gap-3">
             <Clock className="w-6 h-6 text-emerald-200" />
-            <div>
-              <h1 className="text-xl font-bold leading-none">ControlHorario <span className="text-xs font-normal opacity-75">V3</span></h1>
-              <div className="flex items-center gap-2 mt-1">
+            <div className="flex flex-col">
+              <h1 className="text-xl font-bold leading-none">ControlHorario <span className="text-xs font-normal opacity-75">Team</span></h1>
+              {/* Botón de estado clicable para forzar sync */}
+              <button 
+                onClick={fetchData}
+                className="flex items-center gap-2 mt-1 hover:bg-emerald-800 rounded px-1 transition-colors text-left"
+                title="Clic para sincronizar ahora"
+              >
                 {status === 'loading' && <span className="flex items-center text-[10px] text-emerald-200"><RefreshCw className="w-3 h-3 animate-spin mr-1"/> Sincronizando...</span>}
-                {status === 'saving' && <span className="flex items-center text-[10px] text-yellow-200"><Save className="w-3 h-3 mr-1"/> Guardando nube...</span>}
-                {status === 'success' && <span className="flex items-center text-[10px] text-emerald-200"><Cloud className="w-3 h-3 mr-1"/> Nube OK</span>}
-                {status === 'error' && <span className="flex items-center text-[10px] text-red-300"><AlertCircle className="w-3 h-3 mr-1"/> Offline (Copia Local Activa)</span>}
-              </div>
+                {status === 'saving' && <span className="flex items-center text-[10px] text-yellow-200"><Save className="w-3 h-3 mr-1"/> Guardando...</span>}
+                {status === 'success' && <span className="flex items-center text-[10px] text-emerald-200"><Wifi className="w-3 h-3 mr-1"/> Online {lastSync && `(${lastSync.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})})`}</span>}
+                {status === 'error' && <span className="flex items-center text-[10px] text-red-300"><WifiOff className="w-3 h-3 mr-1"/> Offline (Modo Local)</span>}
+              </button>
             </div>
           </div>
           <div className="flex items-center bg-emerald-800 rounded-lg p-1">
