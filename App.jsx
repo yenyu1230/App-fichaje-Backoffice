@@ -2,7 +2,8 @@ import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { 
   Calendar, Clock, Users, FileText, Download, 
   ChevronLeft, ChevronRight, AlertCircle, Briefcase, 
-  Palmtree, Cloud, RefreshCw, Save, Coffee, Wifi, WifiOff
+  Palmtree, Cloud, RefreshCw, Save, Coffee, Wifi, WifiOff,
+  UserCheck
 } from 'lucide-react';
 
 // =================================================================
@@ -51,33 +52,36 @@ const formatDate = (y, m, d) => `${y}-${String(m + 1).padStart(2, '0')}-${String
 const isWeekend = (dateStr) => { const d = new Date(dateStr).getDay(); return d === 0 || d === 6; };
 const isFriday = (dateStr) => new Date(dateStr).getDay() === 5;
 
-// Cálculo actualizado con deducción de descanso
-const calculateHours = (s, e, breakMins = 0) => {
-  if (!s || !e) return 0;
-  const [sH, sM] = s.split(':').map(Number); const [eH, eM] = e.split(':').map(Number);
-  let diff = (eH * 60 + eM) - (sH * 60 + sM); 
+// Calcula diferencia en minutos de forma segura (evita NaN)
+const diffMinutes = (start, end) => {
+  if (!start || !end) return 0;
+  const [sH, sM] = start.split(':').map(Number);
+  const [eH, eM] = end.split(':').map(Number);
+  
+  // Validación extra anti-NaN
+  if (isNaN(sH) || isNaN(sM) || isNaN(eH) || isNaN(eM)) return 0;
+
+  let diff = (eH * 60 + eM) - (sH * 60 + sM);
   if (diff < 0) diff += 24 * 60;
-  
-  // Restar descanso (asegurando que no sea negativo)
-  diff = Math.max(0, diff - (Number(breakMins) || 0));
-  
-  return Number((diff / 60).toFixed(2));
+  return diff;
+};
+
+// Cálculo actualizado: Jornada - Descanso
+const calculateHours = (s, e, breakMins = 0) => {
+  const totalMins = diffMinutes(s, e);
+  const netMins = Math.max(0, totalMins - (Number(breakMins) || 0));
+  const res = Number((netMins / 60).toFixed(2));
+  return isNaN(res) ? 0 : res; // Asegura que nunca devuelva NaN
 };
 
 export default function App() {
   const [scriptUrl, setScriptUrl] = useState(GOOGLE_SCRIPT_URL);
-  
-  // Refs para control estricto de edición
   const isEditingRef = useRef(false); 
   const dirtyKeysRef = useRef(new Set()); 
 
-  // Estado inicial
   const [entries, setEntries] = useState({});
   const [employees, setEmployees] = useState(INITIAL_EMPLOYEES);
-
-  // Fecha actual automática al iniciar
   const [currentDate, setCurrentDate] = useState(new Date());
-
   const [activeTab, setActiveTab] = useState('timesheet');
   const [selectedEmployeeId, setSelectedEmployeeId] = useState(1);
   const [libsLoaded, setLibsLoaded] = useState(false);
@@ -93,30 +97,20 @@ export default function App() {
   // --- SINCRONIZACIÓN REAL INTELIGENTE ---
 
   const fetchData = async () => {
-    if (!scriptUrl) return;
-    
-    // Si el usuario está escribiendo, NO interrumpimos bajo ningún concepto
-    if (isEditingRef.current) return;
-
+    if (!scriptUrl || isEditingRef.current) return;
     if (Object.keys(entries).length === 0) setStatus('loading');
     
     try {
-      // Agregamos timestamp para evitar caché del navegador (?t=...)
       const response = await fetch(`${scriptUrl}?t=${Date.now()}`);
       const data = await response.json();
       
-      // FUSIÓN INTELIGENTE (Smart Merge):
       if (data.entries) {
         setEntries(currentEntries => {
           const mergedEntries = { ...currentEntries };
           const cloudEntries = data.entries;
-
-          // 1. Incorporamos datos de la nube
           Object.keys(cloudEntries).forEach(key => {
             const cloudVal = cloudEntries[key];
             const localVal = currentEntries[key];
-
-            // Si nosotros hemos tocado esta celda (está 'sucia'), damos prioridad a LO NUESTRO
             if (dirtyKeysRef.current.has(key)) {
               if (JSON.stringify(cloudVal) === JSON.stringify(localVal)) {
                 dirtyKeysRef.current.delete(key);
@@ -126,14 +120,10 @@ export default function App() {
             }
             mergedEntries[key] = cloudVal;
           });
-
           return mergedEntries;
         });
       }
-
-      if (data.employees) {
-        setEmployees(data.employees);
-      }
+      if (data.employees) setEmployees(data.employees);
       setStatus('success');
       setLastSync(new Date());
     } catch (e) {
@@ -180,10 +170,7 @@ export default function App() {
       });
       setStatus('success');
       setLastSync(new Date());
-    } catch (e) {
-      console.error("Error guardando:", e);
-      setStatus('error'); 
-    }
+    } catch (e) { setStatus('error'); }
   };
 
   const saveEmployeeToSheet = async (id, name) => {
@@ -228,17 +215,50 @@ export default function App() {
   };
 
   const getStats = (empId) => {
-    let stats = { standard: 0, regular: 0, holiday: 0, vac: 0, personal: 0, balance: 0 };
+    let stats = { 
+      standard: 0, 
+      regular: 0, 
+      holiday: 0, 
+      vac: 0, 
+      personal: 0, // Días completos
+      personalHours: 0, // Horas parciales
+      balance: 0 
+    };
+
     for (let d = 1; d <= daysInMonth; d++) {
       const dateStr = formatDate(year, month, d);
       const key = `${dateStr}-${empId}`;
       const entry = entries[key] || {};
       const isNonWork = isWeekend(dateStr) || isHoliday(dateStr);
+      
       const worked = calculateHours(entry.start, entry.end, entry.break);
       
       if (entry.type === WORK_TYPES.VACACIONES) { stats.vac++; continue; }
-      if (entry.type === WORK_TYPES.PERSONAL) { stats.personal++; continue; }
+      
+      // Asuntos Propios
+      if (entry.type === WORK_TYPES.PERSONAL) {
+        if (entry.start && entry.end) {
+          // Calculamos la ausencia parcial si existen las horas
+          let absenceH = 0;
+          if (entry.pOut && entry.pIn) {
+             const absMins = diffMinutes(entry.pOut, entry.pIn);
+             const val = Number((absMins / 60).toFixed(2));
+             absenceH = isNaN(val) ? 0 : val; // Protección NaN
+          }
+          
+          stats.standard += 8;
+          stats.regular += worked; 
+          stats.personalHours += absenceH; 
+          // Simplificación: Balance = (Worked + Absence) - 8
+          stats.balance += ((worked + absenceH) - 8);
+        } else {
+          // Día completo sin horas definidas
+          stats.personal++; 
+        }
+        continue;
+      }
 
+      // Día Normal
       if (!isNonWork) {
         stats.standard += 8;
         stats.regular += worked;
@@ -255,14 +275,19 @@ export default function App() {
     const data = employees.map(e => {
       const s = getStats(e.id);
       return { 
-        "Empleado": e.name, "H. Teóricas": s.standard, "Trabajadas": s.regular.toFixed(2), 
-        "Saldo": s.balance.toFixed(2), "Guardia Festivo": s.holiday.toFixed(2), 
-        "Vacaciones": s.vac, "Asuntos": s.personal 
+        "Empleado": e.name, 
+        "H. Teóricas": s.standard, 
+        "Trabajadas": s.regular.toFixed(2), 
+        "H. Ausencia Justif.": s.personalHours.toFixed(2),
+        "Saldo": s.balance.toFixed(2), 
+        "Guardia Festivo": s.holiday.toFixed(2), 
+        "Vacaciones": s.vac, 
+        "Días Asuntos P.": s.personal 
       };
     });
     const wb = window.XLSX.utils.book_new();
     const ws = window.XLSX.utils.json_to_sheet(data);
-    ws['!cols'] = [{wch:20},{wch:10},{wch:10},{wch:10},{wch:15},{wch:10},{wch:10}];
+    ws['!cols'] = [{wch:20},{wch:10},{wch:10},{wch:15},{wch:10},{wch:15},{wch:10},{wch:15}];
     window.XLSX.utils.book_append_sheet(wb, ws, "Informe");
     window.XLSX.writeFile(wb, `Fichajes_${year}_${month+1}.xlsx`);
   };
@@ -272,10 +297,16 @@ export default function App() {
     const { jsPDF } = window.jspdf; const doc = new jsPDF();
     const rows = employees.map(e => {
       const s = getStats(e.id);
-      return [e.name, s.standard, s.regular.toFixed(2), s.balance.toFixed(2), s.holiday.toFixed(2), s.vac, s.personal];
+      return [
+        e.name, s.standard, s.regular.toFixed(2), s.personalHours.toFixed(2), 
+        s.balance.toFixed(2), s.holiday.toFixed(2), s.vac, s.personal
+      ];
     });
     doc.text(`Informe ${new Date(year, month).toLocaleString('es',{month:'long',year:'numeric'})}`, 14, 15);
-    doc.autoTable({ head: [["Empleado", "Teóricas", "Trabajadas", "Saldo", "Guardia", "Vac", "Asun"]], body: rows, startY: 25 });
+    doc.autoTable({ 
+      head: [["Empleado", "Teóricas", "Trabajadas", "H. Ausencia", "Saldo", "Guardia", "Vac", "Días AP"]], 
+      body: rows, startY: 25, styles: { fontSize: 8 }
+    });
     doc.save(`Fichajes_${year}_${month+1}.pdf`);
   };
 
@@ -289,11 +320,7 @@ export default function App() {
             <Clock className="w-6 h-6 text-emerald-200" />
             <div className="flex flex-col">
               <h1 className="text-xl font-bold leading-none">ControlHorario <span className="text-xs font-normal opacity-75">Team</span></h1>
-              <button 
-                onClick={fetchData}
-                className="flex items-center gap-2 mt-1 hover:bg-emerald-800 rounded px-1 transition-colors text-left"
-                title="Clic para sincronizar ahora"
-              >
+              <button onClick={fetchData} className="flex items-center gap-2 mt-1 hover:bg-emerald-800 rounded px-1 transition-colors text-left" title="Clic para sincronizar ahora">
                 {status === 'loading' && <span className="flex items-center text-[10px] text-emerald-200"><RefreshCw className="w-3 h-3 animate-spin mr-1"/> Sincronizando...</span>}
                 {status === 'saving' && <span className="flex items-center text-[10px] text-yellow-200"><Save className="w-3 h-3 mr-1"/> Guardando...</span>}
                 {status === 'success' && <span className="flex items-center text-[10px] text-emerald-200"><Wifi className="w-3 h-3 mr-1"/> Online {lastSync && `(${lastSync.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})})`}</span>}
@@ -338,7 +365,7 @@ export default function App() {
                     <th className="px-4 py-3 text-center">Salida</th>
                     <th className="px-2 py-3 text-center w-24" title="Descanso en minutos">Desc. (min)</th>
                     <th className="px-4 py-3 text-right">Total</th>
-                    <th className="px-4 py-3">Notas</th>
+                    <th className="px-4 py-3">Notas / Incidencias</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -348,75 +375,54 @@ export default function App() {
                     const isHol = isHoliday(dStr); const isWk = dObj.getDay()===0||dObj.getDay()===6; const isFri = dObj.getDay()===5;
                     const h = calculateHours(entry.start, entry.end, entry.break);
                     const warn = isFri && entry.end && parseInt(entry.end) >= 15 && h > 7;
+                    
+                    const isPersonalAffair = entry.type === WORK_TYPES.PERSONAL;
+                    // Deshabilitar inputs SOLO si es Vacaciones o Baja (Asuntos Propios ahora permite editar)
+                    const disabledInputs = entry.type === WORK_TYPES.VACACIONES || entry.type === WORK_TYPES.BAJA;
 
                     return (
                       <tr key={day} className={`border-b ${isHol ? 'bg-red-50' : isWk ? 'bg-orange-50' : 'hover:bg-gray-50'}`}>
                         <td className="px-4 py-2 font-medium flex items-center gap-2">
                           <span className="w-5 text-gray-500">{day}</span><span className="text-xs text-gray-400 w-8">{dObj.toLocaleString('es-ES', {weekday:'short'})}</span>
-                          {isHol && <Palmtree size={12} className="text-red-500"/>} {isFri && <Briefcase size={12} className="text-blue-400"/>}
+                          {isHol && <Palmtree size={12} className="text-red-500"/>} 
+                          {isFri && <Briefcase size={12} className="text-blue-400"/>}
+                          {isPersonalAffair && <UserCheck size={12} className="text-purple-500"/>}
                         </td>
                         <td className="px-4 py-2">
-                          <select value={entry.type} onChange={(e) => handleEntryChange(dStr, 'type', e.target.value)} className="bg-transparent text-xs outline-none w-full">
+                          <select value={entry.type} onChange={(e) => handleEntryChange(dStr, 'type', e.target.value)} className="bg-transparent text-xs outline-none w-full font-medium">
                             {Object.values(WORK_TYPES).map(t => <option key={t} value={t}>{t}</option>)}
                           </select>
                         </td>
                         <td className="px-4 py-2 text-center">
-                          <input 
-                            type="time" 
-                            value={entry.start||''} 
-                            onChange={(e) => handleEntryChange(dStr, 'start', e.target.value)} 
-                            onFocus={handleFocus} 
-                            onBlur={handleBlur}   
-                            className="border rounded px-1 w-20 text-center text-xs" 
-                            disabled={entry.type==='Vacaciones'||entry.type==='Asuntos Propios'}
-                          />
+                          <input type="time" value={entry.start||''} onChange={(e) => handleEntryChange(dStr, 'start', e.target.value)} onFocus={handleFocus} onBlur={handleBlur} className="border rounded px-1 w-20 text-center text-xs" disabled={disabledInputs}/>
                         </td>
                         <td className="px-4 py-2 text-center">
                           <div className="flex flex-col items-center justify-center">
-                            <input 
-                              type="time" 
-                              value={entry.end||''} 
-                              onChange={(e) => handleEntryChange(dStr, 'end', e.target.value)} 
-                              onFocus={handleFocus} 
-                              onBlur={handleBlur}   
-                              className={`border rounded px-1 w-20 text-center text-xs ${warn ? 'border-amber-500 text-amber-700 font-bold' : ''}`} 
-                              disabled={entry.type==='Vacaciones'||entry.type==='Asuntos Propios'}
-                            />
-                            {warn && (
-                              <span className="text-[9px] bg-amber-100 text-amber-700 px-1 rounded mt-1 whitespace-nowrap">
-                                Viernes tarde
-                              </span>
-                            )}
+                            <input type="time" value={entry.end||''} onChange={(e) => handleEntryChange(dStr, 'end', e.target.value)} onFocus={handleFocus} onBlur={handleBlur} className={`border rounded px-1 w-20 text-center text-xs ${warn ? 'border-amber-500 text-amber-700 font-bold' : ''}`} disabled={disabledInputs}/>
+                            {warn && <span className="text-[9px] bg-amber-100 text-amber-700 px-1 rounded mt-1 whitespace-nowrap">Viernes tarde</span>}
                           </div>
                         </td>
                         <td className="px-2 py-2 text-center">
                           <div className="flex items-center justify-center relative">
-                            <input 
-                              type="number" 
-                              min="0"
-                              max="120"
-                              placeholder="0"
-                              value={entry.break || ''} 
-                              onChange={(e) => handleEntryChange(dStr, 'break', e.target.value)} 
-                              onFocus={handleFocus} 
-                              onBlur={handleBlur}   
-                              className="border rounded px-1 w-12 text-center text-xs bg-gray-50 focus:bg-white" 
-                              disabled={entry.type==='Vacaciones'||entry.type==='Asuntos Propios' || !entry.start}
-                            />
+                            <input type="number" min="0" max="120" placeholder="0" value={entry.break || ''} onChange={(e) => handleEntryChange(dStr, 'break', e.target.value)} onFocus={handleFocus} onBlur={handleBlur} className="border rounded px-1 w-12 text-center text-xs bg-gray-50 focus:bg-white" disabled={disabledInputs || !entry.start}/>
                             {entry.break > 0 && <span className="absolute -top-2 -right-1 text-[8px] text-gray-400">min</span>}
                           </div>
                         </td>
                         <td className="px-4 py-2 text-right font-mono font-medium">{h > 0 ? h.toFixed(2) : '-'}</td>
                         <td className="px-4 py-2">
-                          <input 
-                            type="text" 
-                            placeholder="..." 
-                            value={entry.notes||''} 
-                            onChange={(e) => handleEntryChange(dStr, 'notes', e.target.value)} 
-                            onFocus={handleFocus} 
-                            onBlur={handleBlur}   
-                            className="w-full text-xs bg-transparent border-b border-gray-100 focus:border-blue-400 outline-none"
-                          />
+                          {isPersonalAffair ? (
+                            <div className="flex flex-col gap-1 bg-purple-50 p-1 rounded border border-purple-100">
+                              <div className="flex gap-1 items-center">
+                                <span className="text-[9px] text-purple-700 font-bold">Salida:</span>
+                                <input type="time" value={entry.pOut||''} onChange={(e) => handleEntryChange(dStr, 'pOut', e.target.value)} onFocus={handleFocus} onBlur={handleBlur} className="border rounded px-1 h-5 text-[10px] w-20 bg-white"/>
+                                <span className="text-[9px] text-purple-700 font-bold ml-1">Vuelta:</span>
+                                <input type="time" value={entry.pIn||''} onChange={(e) => handleEntryChange(dStr, 'pIn', e.target.value)} onFocus={handleFocus} onBlur={handleBlur} className="border rounded px-1 h-5 text-[10px] w-20 bg-white"/>
+                              </div>
+                              <input type="text" placeholder="Motivo asunto..." value={entry.reason||''} onChange={(e) => handleEntryChange(dStr, 'reason', e.target.value)} onFocus={handleFocus} onBlur={handleBlur} className="w-full text-[10px] border-b border-purple-200 bg-transparent focus:border-purple-500 outline-none"/>
+                            </div>
+                          ) : (
+                            <input type="text" placeholder="..." value={entry.notes||''} onChange={(e) => handleEntryChange(dStr, 'notes', e.target.value)} onFocus={handleFocus} onBlur={handleBlur} className="w-full text-xs bg-transparent border-b border-gray-100 focus:border-blue-400 outline-none"/>
+                          )}
                         </td>
                       </tr>
                     );
@@ -439,7 +445,14 @@ export default function App() {
             <div className="overflow-x-auto">
               <table className="w-full text-sm text-left border rounded-lg">
                 <thead className="bg-gray-100 text-xs text-gray-700 uppercase">
-                  <tr><th className="px-4 py-3">Empleado</th><th className="px-4 py-3 text-right">Teóricas</th><th className="px-4 py-3 text-right">Trabajadas</th><th className="px-4 py-3 text-right bg-blue-50">Saldo</th><th className="px-4 py-3 text-right bg-orange-50 text-orange-800">Festivo</th></tr>
+                  <tr>
+                    <th className="px-4 py-3">Empleado</th>
+                    <th className="px-4 py-3 text-right">Teóricas</th>
+                    <th className="px-4 py-3 text-right">Trabajadas</th>
+                    <th className="px-4 py-3 text-right bg-purple-50 text-purple-800">H. Ausencia Justif.</th>
+                    <th className="px-4 py-3 text-right bg-blue-50">Saldo Total</th>
+                    <th className="px-4 py-3 text-right bg-orange-50 text-orange-800">Festivo</th>
+                  </tr>
                 </thead>
                 <tbody>
                   {employees.map(e => {
@@ -449,6 +462,7 @@ export default function App() {
                         <td className="px-4 py-3 font-medium">{e.name}</td>
                         <td className="px-4 py-3 text-right">{s.standard}h</td>
                         <td className="px-4 py-3 text-right">{s.regular.toFixed(2)}h</td>
+                        <td className="px-4 py-3 text-right bg-purple-50 text-purple-800 font-medium">{s.personalHours > 0 ? s.personalHours.toFixed(2)+'h' : '-'}</td>
                         <td className={`px-4 py-3 text-right font-bold bg-blue-50 ${s.balance>=0?'text-green-600':'text-red-600'}`}>{s.balance.toFixed(2)}h</td>
                         <td className="px-4 py-3 text-right bg-orange-50 font-bold text-orange-800">{s.holiday>0?s.holiday.toFixed(2)+'h':'-'}</td>
                       </tr>
